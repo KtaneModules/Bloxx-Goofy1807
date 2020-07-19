@@ -5,7 +5,6 @@ using UnityEngine;
 
 public class BloxxScript : MonoBehaviour
 {
-
     public KMAudio Audio;
     public KMBombInfo Bomb;
     public KMBombModule Module;
@@ -23,20 +22,78 @@ public class BloxxScript : MonoBehaviour
     bool moveActive = false;
     bool resetActive = false;
     bool strikeActive = false;
-    List<int> moves = new List<int>();
+    readonly List<int> moves = new List<int>();
 
-    int curPosX;
-    int curPosY;
-    Orientation orientation;
+    GameObject player;
+    GameObject block;
+    GameState state;
+
     enum Orientation
     {
         Upright,
         Horiz,
         Vert
     }
+    sealed class GameState
+    {
+        public int curPosX;
+        public int curPosY;
+        public Orientation orientation;
 
-    GameObject player;
-    GameObject block;
+        public GameState Move(int direction)
+        {
+            var newState = new GameState { curPosX = curPosX, curPosY = curPosY, orientation = orientation };
+            newState.moveImpl(direction);
+            return newState;
+        }
+
+        private void moveImpl(int direction)
+        {
+            switch (orientation)
+            {
+                case Orientation.Upright:
+                    switch (direction)
+                    {
+                        case 0: curPosY -= 2; orientation = Orientation.Vert; break;
+                        case 1: curPosY++; orientation = Orientation.Vert; break;
+                        case 2: curPosX -= 2; orientation = Orientation.Horiz; break;
+                        case 3: curPosX++; orientation = Orientation.Horiz; break;
+                    }
+                    break;
+                case Orientation.Horiz:
+                    switch (direction)
+                    {
+                        case 0: curPosY--; break;
+                        case 1: curPosY++; break;
+                        case 2: curPosX--; orientation = Orientation.Upright; break;
+                        case 3: curPosX += 2; orientation = Orientation.Upright; break;
+                    }
+                    break;
+                case Orientation.Vert:
+                    switch (direction)
+                    {
+                        case 0: curPosY--; orientation = Orientation.Upright; break;
+                        case 1: curPosY += 2; orientation = Orientation.Upright; break;
+                        case 2: curPosX--; break;
+                        case 3: curPosX++; break;
+                    }
+                    break;
+            }
+        }
+
+        public bool DeservesStrike(string grid, int cols)
+        {
+            var rows = grid.Length / cols;
+            return curPosX < 0 || curPosX >= cols || curPosY < 0 || curPosY >= rows || grid[curPosX + cols * curPosY] == '-' ||
+                        (orientation == Orientation.Horiz && (curPosX >= cols - 1 || grid[curPosX + 1 + cols * curPosY] == '-')) ||
+                        (orientation == Orientation.Vert && (curPosY >= rows - 1 || grid[curPosX + cols * (curPosY + 1)] == '-'));
+        }
+
+        public bool IsSolved(string grid, int cols)
+        {
+            return orientation == Orientation.Upright && grid[curPosX + cols * curPosY] == 'X';
+        }
+    }
 
     void Start()
     {
@@ -70,25 +127,29 @@ public class BloxxScript : MonoBehaviour
         }
 
         var startPos = grid.IndexOf(ch => "HVU".Contains(ch));
-        curPosX = startPos % cols;
-        curPosY = startPos / cols;
-        orientation = grid[startPos] == 'H' ? Orientation.Horiz : grid[startPos] == 'V' ? Orientation.Vert : Orientation.Upright;
+        state = new GameState
+        {
+            curPosX = startPos % cols,
+            curPosY = startPos / cols,
+            orientation = grid[startPos] == 'H' ? Orientation.Horiz : grid[startPos] == 'V' ? Orientation.Vert : Orientation.Upright
+        };
 
         player = Instantiate(Block, transform.Find("GameObjects"));
         player.name = "Player";
         block = player.transform.Find("Block").gameObject;
-        switch (orientation)
+
+        switch (state.orientation)
         {
             case Orientation.Upright:
-                player.transform.localPosition = new Vector3(-0.07f + (0.01f * curPosX), 0.0101f, 0.07f - (0.01f * curPosY));
+                player.transform.localPosition = new Vector3(-0.07f + (0.01f * state.curPosX), 0.0101f, 0.07f - (0.01f * state.curPosY));
                 block.transform.localPosition = new Vector3(0, block.transform.localPosition.y + 0.005f, 0);
                 block.transform.localEulerAngles = new Vector3(0, 0, 90);
                 break;
             case Orientation.Horiz:
-                player.transform.localPosition = new Vector3(-0.07f + (0.01f * curPosX) + 0.005f, 0.0101f, 0.07f - (0.01f * curPosY));
+                player.transform.localPosition = new Vector3(-0.07f + (0.01f * state.curPosX) + 0.005f, 0.0101f, 0.07f - (0.01f * state.curPosY));
                 break;
             case Orientation.Vert:
-                player.transform.localPosition = new Vector3(-0.07f + (0.01f * curPosX), 0.0101f, 0.07f - (0.01f * curPosY) - 0.005f);
+                player.transform.localPosition = new Vector3(-0.07f + (0.01f * state.curPosX), 0.0101f, 0.07f - (0.01f * state.curPosY) - 0.005f);
                 block.transform.localEulerAngles = new Vector3(0, 90, 0);
                 break;
         }
@@ -117,8 +178,6 @@ public class BloxxScript : MonoBehaviour
                     Arrows[2].OnInteract();
                     yield return new WaitUntil(() => !moveActive);
                     break;
-                default:
-                    yield break;
             }
             moves.RemoveAt(moves.Count() - 1);
         }
@@ -129,22 +188,23 @@ public class BloxxScript : MonoBehaviour
     {
         return delegate
         {
-            if (moduleSolved || moveActive)
+            if (moduleSolved || moveActive || resetActive || strikeActive)
                 return false;
-            if (!resetActive && !strikeActive)
-                moves.Add(btn);
 
-            StartCoroutine(movePlayer(btn));
+            moves.Add(btn);
+            var newState = state.Move(btn);
+            StartCoroutine(movePlayer(btn, state, newState));
+            state = newState;
             return false;
         };
     }
 
-    IEnumerator movePlayer(int btn)
+    IEnumerator movePlayer(int btn, GameState oldState, GameState newState)
     {
         moveActive = true;
         var duration = resetActive ? .1f : .3f;
         var elapsed = 0f;
-        if (orientation == Orientation.Horiz)
+        if (oldState.orientation == Orientation.Horiz)
         {
             switch (btn)
             {
@@ -160,7 +220,6 @@ public class BloxxScript : MonoBehaviour
                     player.transform.localPosition = new Vector3(player.transform.localPosition.x, player.transform.localPosition.y, player.transform.localPosition.z + 0.005f);
                     block.transform.localPosition = new Vector3(block.transform.localPosition.x, block.transform.localPosition.y, block.transform.localPosition.z + 0.005f);
                     player.transform.localEulerAngles = new Vector3(0, 0, 0);
-                    curPosY--;
                     break;
                 case 1:
                     player.transform.localPosition = new Vector3(player.transform.localPosition.x, player.transform.localPosition.y, player.transform.localPosition.z - 0.005f);
@@ -174,7 +233,6 @@ public class BloxxScript : MonoBehaviour
                     player.transform.localPosition = new Vector3(player.transform.localPosition.x, player.transform.localPosition.y, player.transform.localPosition.z - 0.005f);
                     block.transform.localPosition = new Vector3(block.transform.localPosition.x, block.transform.localPosition.y, block.transform.localPosition.z - 0.005f);
                     player.transform.localEulerAngles = new Vector3(0, 0, 0);
-                    curPosY++;
                     break;
                 case 2:
                     player.transform.localPosition = new Vector3(player.transform.localPosition.x - 0.01f, player.transform.localPosition.y, player.transform.localPosition.z);
@@ -189,8 +247,6 @@ public class BloxxScript : MonoBehaviour
                     block.transform.localPosition = new Vector3(block.transform.localPosition.x - 0.01f, block.transform.localPosition.y + 0.005f, block.transform.localPosition.z);
                     player.transform.localEulerAngles = new Vector3(0, 0, 0);
                     block.transform.localEulerAngles = new Vector3(0, 0, 90);
-                    curPosX--;
-                    orientation = Orientation.Upright;
                     break;
                 case 3:
                     player.transform.localPosition = new Vector3(player.transform.localPosition.x + 0.01f, player.transform.localPosition.y, player.transform.localPosition.z);
@@ -205,14 +261,10 @@ public class BloxxScript : MonoBehaviour
                     block.transform.localPosition = new Vector3(block.transform.localPosition.x + 0.01f, block.transform.localPosition.y + 0.005f, block.transform.localPosition.z);
                     player.transform.localEulerAngles = new Vector3(0, 0, 0);
                     block.transform.localEulerAngles = new Vector3(0, 0, -90);
-                    curPosX += 2;
-                    orientation = Orientation.Upright;
                     break;
-                default:
-                    yield break;
             }
         }
-        else if (orientation == Orientation.Upright)
+        else if (oldState.orientation == Orientation.Upright)
         {
             switch (btn)
             {
@@ -229,8 +281,6 @@ public class BloxxScript : MonoBehaviour
                     block.transform.localPosition = new Vector3(block.transform.localPosition.x, block.transform.localPosition.y - 0.005f, block.transform.localPosition.z + 0.005f);
                     player.transform.localEulerAngles = new Vector3(0, 0, 0);
                     block.transform.localEulerAngles = new Vector3(0, 90, 0);
-                    curPosY -= 2;
-                    orientation = Orientation.Vert;
                     break;
                 case 1:
                     player.transform.localPosition = new Vector3(player.transform.localPosition.x, player.transform.localPosition.y, player.transform.localPosition.z - 0.005f);
@@ -245,8 +295,6 @@ public class BloxxScript : MonoBehaviour
                     block.transform.localPosition = new Vector3(block.transform.localPosition.x, block.transform.localPosition.y - 0.005f, block.transform.localPosition.z - 0.005f);
                     player.transform.localEulerAngles = new Vector3(0, 0, 0);
                     block.transform.localEulerAngles = new Vector3(0, 90, 0);
-                    curPosY++;
-                    orientation = Orientation.Vert;
                     break;
                 case 2:
                     player.transform.localPosition = new Vector3(player.transform.localPosition.x - 0.005f, player.transform.localPosition.y, player.transform.localPosition.z);
@@ -261,8 +309,6 @@ public class BloxxScript : MonoBehaviour
                     block.transform.localPosition = new Vector3(block.transform.localPosition.x - 0.005f, block.transform.localPosition.y - 0.005f, block.transform.localPosition.z);
                     player.transform.localEulerAngles = new Vector3(0, 0, 0);
                     block.transform.localEulerAngles = new Vector3(0, 0, 0);
-                    curPosX -= 2;
-                    orientation = Orientation.Horiz;
                     break;
                 case 3:
                     player.transform.localPosition = new Vector3(player.transform.localPosition.x + 0.005f, player.transform.localPosition.y, player.transform.localPosition.z);
@@ -277,11 +323,7 @@ public class BloxxScript : MonoBehaviour
                     block.transform.localPosition = new Vector3(block.transform.localPosition.x + 0.005f, block.transform.localPosition.y - 0.005f, block.transform.localPosition.z);
                     player.transform.localEulerAngles = new Vector3(0, 0, 0);
                     block.transform.localEulerAngles = new Vector3(0, 0, 0);
-                    curPosX++;
-                    orientation = Orientation.Horiz;
                     break;
-                default:
-                    yield break;
             }
         }
         else    // Orientation.Vert
@@ -301,8 +343,6 @@ public class BloxxScript : MonoBehaviour
                     block.transform.localPosition = new Vector3(block.transform.localPosition.x, block.transform.localPosition.y + 0.005f, block.transform.localPosition.z + 0.01f);
                     player.transform.localEulerAngles = new Vector3(0, 0, 0);
                     block.transform.localEulerAngles = new Vector3(0, 0, 90);
-                    curPosY--;
-                    orientation = Orientation.Upright;
                     break;
                 case 1:
                     player.transform.localPosition = new Vector3(player.transform.localPosition.x, player.transform.localPosition.y, player.transform.localPosition.z - 0.01f);
@@ -317,8 +357,6 @@ public class BloxxScript : MonoBehaviour
                     block.transform.localPosition = new Vector3(block.transform.localPosition.x, block.transform.localPosition.y + 0.005f, block.transform.localPosition.z - 0.01f);
                     player.transform.localEulerAngles = new Vector3(0, 0, 0);
                     block.transform.localEulerAngles = new Vector3(0, 0, 90);
-                    curPosY += 2;
-                    orientation = Orientation.Upright;
                     break;
                 case 2:
                     player.transform.localPosition = new Vector3(player.transform.localPosition.x - 0.005f, player.transform.localPosition.y, player.transform.localPosition.z);
@@ -332,7 +370,6 @@ public class BloxxScript : MonoBehaviour
                     player.transform.localPosition = new Vector3(player.transform.localPosition.x - 0.005f, player.transform.localPosition.y, player.transform.localPosition.z);
                     block.transform.localPosition = new Vector3(block.transform.localPosition.x - 0.005f, block.transform.localPosition.y, block.transform.localPosition.z);
                     player.transform.localEulerAngles = new Vector3(0, 0, 0);
-                    curPosX--;
                     break;
                 case 3:
                     player.transform.localPosition = new Vector3(player.transform.localPosition.x + 0.005f, player.transform.localPosition.y, player.transform.localPosition.z);
@@ -346,70 +383,36 @@ public class BloxxScript : MonoBehaviour
                     player.transform.localPosition = new Vector3(player.transform.localPosition.x + 0.005f, player.transform.localPosition.y, player.transform.localPosition.z);
                     block.transform.localPosition = new Vector3(block.transform.localPosition.x + 0.005f, block.transform.localPosition.y, block.transform.localPosition.z);
                     player.transform.localEulerAngles = new Vector3(0, 0, 0);
-                    curPosX++;
                     break;
-                default:
-                    yield break;
             }
         }
         moveActive = false;
 
-        if (curPosX < 0 || curPosX >= cols || curPosY < 0 || curPosY >= rows || grid[curPosX + cols * curPosY] == '-')
-            goto Strike;
-
-        switch (orientation)
+        if (newState.DeservesStrike(grid, cols))
         {
-            case Orientation.Upright:
-                if (grid[curPosX + cols * curPosY] == 'X')
-                    goto Solve;
-                break;
-
-            case Orientation.Horiz:
-                if (curPosX >= cols - 1 || grid[curPosX + 1 + cols * curPosY] == '-')
-                    goto Strike;
-                break;
-
-            case Orientation.Vert:
-                if (curPosY >= rows - 1 || grid[curPosX + cols * (curPosY + 1)] == '-')
-                    goto Strike;
-                break;
+            // Ran into a wall — strike
+            Module.HandleStrike();
+            strikeActive = true;
+            var oppositeButton = new[] { 1, 0, 3, 2 }[btn];
+            yield return movePlayer(oppositeButton, newState, oldState);
+            state = oldState;
+            strikeActive = false;
         }
-        yield break;
-
-        Strike:
-        Module.HandleStrike();
-        strikeActive = true;
-        moves.RemoveAt(moves.Count() - 1);
-        switch (btn)
+        else if (newState.IsSolved(grid, cols))
         {
-            case 0:
-                Arrows[1].OnInteract();
-                break;
-            case 1:
-                Arrows[0].OnInteract();
-                break;
-            case 2:
-                Arrows[3].OnInteract();
-                break;
-            case 3:
-                Arrows[2].OnInteract();
-                break;
-            default:
-                yield break;
-        }
-        strikeActive = false;
-        yield break;
-
-        Solve:
-        moduleSolved = true;
-        Module.HandlePass();
-        var solveDuration = 1f;
-        var solveElapsed = 0f;
-        while (solveElapsed < solveDuration)
-        {
-            yield return null;
-            solveElapsed += Time.deltaTime;
-            player.transform.localPosition = Vector3.Lerp(new Vector3(player.transform.localPosition.x, player.transform.localPosition.y - 0.0005f, player.transform.localPosition.z), player.transform.localPosition, solveElapsed / solveDuration);
+            // Reached the goal position — solve
+            moduleSolved = true;
+            Module.HandlePass();
+            duration = 1f;
+            elapsed = 0f;
+            var oldPos = player.transform.localPosition;
+            var newPos = new Vector3(player.transform.localPosition.x, -0.011f, player.transform.localPosition.z);
+            while (elapsed < duration)
+            {
+                yield return null;
+                elapsed += Time.deltaTime;
+                player.transform.localPosition = Vector3.Lerp(oldPos, newPos, elapsed / duration);
+            }
         }
         yield break;
     }
