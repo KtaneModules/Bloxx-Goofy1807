@@ -1,9 +1,16 @@
-﻿using System.Collections;
+﻿using System;
+using System.Collections;
 using System.Collections.Generic;
 using System.Linq;
+using System.Text.RegularExpressions;
+using System.Threading;
+using Bloxx;
+using RT.Dijkstra;
 using UnityEngine;
 
-public class BloxxScript : MonoBehaviour
+using Rnd = UnityEngine.Random;
+
+public partial class BloxxScript : MonoBehaviour
 {
     public KMAudio Audio;
     public KMBombInfo Bomb;
@@ -13,87 +20,25 @@ public class BloxxScript : MonoBehaviour
     public GameObject Plane;
     public GameObject Block;
 
-    static int moduleIdCounter = 1;
-    int moduleId;
-    int cols;
-    int rows;
+    const int cols = 15;
+    const int rows = 11;
+    const int numCheckPoints = 6;
+    const string validPositions = "###########----###########----############---#############--#########################################################################################################";
     string grid;
     bool moduleSolved = false;
     bool moveActive = false;
     bool resetActive = false;
     bool strikeActive = false;
+    bool threadReady = false;
+    PathElement[] solution; // used only by the TP autosolver
     readonly List<int> moves = new List<int>();
+    static int moduleIdCounter = 1;
+    int moduleId;
+    static readonly int[] oppositeButtons = new[] { 1, 0, 3, 2 };
 
     GameObject player;
     GameObject block;
     GameState state;
-
-    enum Orientation
-    {
-        Upright,
-        Horiz,
-        Vert
-    }
-    sealed class GameState
-    {
-        public int curPosX;
-        public int curPosY;
-        public Orientation orientation;
-
-        public GameState Move(int direction)
-        {
-            var newState = new GameState { curPosX = curPosX, curPosY = curPosY, orientation = orientation };
-            newState.moveImpl(direction);
-            return newState;
-        }
-
-        private void moveImpl(int direction)
-        {
-            switch (orientation)
-            {
-                case Orientation.Upright:
-                    switch (direction)
-                    {
-                        case 0: curPosY -= 2; orientation = Orientation.Vert; break;
-                        case 1: curPosY++; orientation = Orientation.Vert; break;
-                        case 2: curPosX -= 2; orientation = Orientation.Horiz; break;
-                        case 3: curPosX++; orientation = Orientation.Horiz; break;
-                    }
-                    break;
-                case Orientation.Horiz:
-                    switch (direction)
-                    {
-                        case 0: curPosY--; break;
-                        case 1: curPosY++; break;
-                        case 2: curPosX--; orientation = Orientation.Upright; break;
-                        case 3: curPosX += 2; orientation = Orientation.Upright; break;
-                    }
-                    break;
-                case Orientation.Vert:
-                    switch (direction)
-                    {
-                        case 0: curPosY--; orientation = Orientation.Upright; break;
-                        case 1: curPosY += 2; orientation = Orientation.Upright; break;
-                        case 2: curPosX--; break;
-                        case 3: curPosX++; break;
-                    }
-                    break;
-            }
-        }
-
-        public bool DeservesStrike(string grid, int cols)
-        {
-            var rows = grid.Length / cols;
-            return curPosX < 0 || curPosX >= cols || curPosY < 0 || curPosY >= rows || grid[curPosX + cols * curPosY] == '-' ||
-                        (orientation == Orientation.Horiz && (curPosX >= cols - 1 || grid[curPosX + 1 + cols * curPosY] == '-')) ||
-                        (orientation == Orientation.Vert && (curPosY >= rows - 1 || grid[curPosX + cols * (curPosY + 1)] == '-'));
-        }
-
-        public bool IsSolved(string grid, int cols)
-        {
-            return orientation == Orientation.Upright && grid[curPosX + cols * curPosY] == 'X';
-        }
-    }
 
     void Start()
     {
@@ -103,14 +48,27 @@ public class BloxxScript : MonoBehaviour
 
         Reset.OnInteract += delegate ()
         {
+            Audio.PlayGameSoundAtTransform(KMSoundOverride.SoundEffect.ButtonPress, Reset.transform);
+            Reset.AddInteractionPunch();
+            if (!threadReady || moduleSolved || moveActive || resetActive || strikeActive)
+                return false;
+
             StartCoroutine(ResetGame());
             return false;
         };
 
-        cols = 15;
-        rows = 11;
-        grid = "V##########----###########----############---#############--########################################################################################################X";
+        var seed = Rnd.Range(0, int.MaxValue);
+        var thread = new Thread(() => LevelGenerator(seed));
+        thread.Start();
+        StartCoroutine(waitForThread());
+    }
 
+    IEnumerator waitForThread()
+    {
+        while (!threadReady)
+            yield return null;
+
+        Debug.LogFormat("[Bloxx #{0}] Grid:\n{1}", moduleId, Enumerable.Range(0, rows).Select(row => grid.Substring(cols * row, cols)).Join("\n"));
         for (int i = 0; i < rows; i++)
         {
             var gridRow = grid.Substring(i * cols, cols);
@@ -125,14 +83,6 @@ public class BloxxScript : MonoBehaviour
                 }
             }
         }
-
-        var startPos = grid.IndexOf(ch => "HVU".Contains(ch));
-        state = new GameState
-        {
-            curPosX = startPos % cols,
-            curPosY = startPos / cols,
-            orientation = grid[startPos] == 'H' ? Orientation.Horiz : grid[startPos] == 'V' ? Orientation.Vert : Orientation.Upright
-        };
 
         player = Instantiate(Block, transform.Find("GameObjects"));
         player.name = "Player";
@@ -155,31 +105,95 @@ public class BloxxScript : MonoBehaviour
         }
     }
 
+    void LevelGenerator(int seed)
+    {
+        var rnd = new System.Random(seed);
+        int unusedVariable;
+
+        startOver:
+        var validStates = new List<GameState>();
+        for (var x = 0; x < cols; x++)
+            for (var y = 0; y < rows; y++)
+                foreach (var or in new[] { Orientation.Horiz, Orientation.Vert, Orientation.Upright })
+                {
+                    var state = new GameState { curPosX = x, curPosY = y, orientation = or };
+                    if (!state.DeservesStrike(validPositions, cols))
+                        validStates.Add(state);
+                }
+
+        var checkPoints = new List<GameState>();
+        var startChPtIx = rnd.Next(0, validStates.Count);
+        checkPoints.Add(validStates[startChPtIx]);
+        validStates.RemoveAt(startChPtIx);
+        var newGrid = new char[validPositions.Length];
+        for (var i = 0; i < newGrid.Length; i++)
+            newGrid[i] = '-';
+
+        for (var i = 1; i < numCheckPoints; i++)
+        {
+            tryAgain:
+            var ix = rnd.Next(0, validStates.Count);
+            if (i == numCheckPoints - 1 && validStates[ix].orientation != Orientation.Upright)
+                goto tryAgain;
+            if (i > 0 && ManhattanDistance(checkPoints.Last(), validStates[ix]) < 7)
+                goto tryAgain;
+            var nextCheckPoint = validStates[ix];
+
+            try
+            {
+                var node = new BloxxNode { ValidStates = new HashSet<GameState>(validStates), GameState = checkPoints.Last(), DesiredEndState = nextCheckPoint };
+                var path = DijkstrasAlgorithm.Run(node, 0, (a, b) => a + b, out unusedVariable);
+                foreach (var tup in path)
+                {
+                    tup.State.MarkUsed(newGrid, cols);
+                    validStates.Remove(tup.State);
+                }
+                checkPoints.Add(nextCheckPoint);
+            }
+            catch (DijkstraNoSolutionException<int, PathElement>)
+            {
+                goto startOver;
+            }
+            validStates.Remove(nextCheckPoint);
+        }
+
+        // Find shortest path
+        var overallStart = new BloxxNode { GameState = checkPoints[0], DesiredEndState = checkPoints.Last(), ValidPositions = new string(newGrid), ValidPositionsWidth = cols };
+        var shortestPath = DijkstrasAlgorithm.Run(overallStart, 0, (a, b) => a + b, out unusedVariable).ToArray();
+
+        var finalGrid = new char[validPositions.Length];
+        for (var i = 0; i < finalGrid.Length; i++)
+            finalGrid[i] = '-';
+        // Mark reachable squares
+        for (var spIx = 0; spIx < shortestPath.Length; spIx++)
+            shortestPath[spIx].State.MarkUsed(finalGrid, cols, spIx == shortestPath.Length - 1 ? 'X' : '#');
+        // Mark start and end location
+        checkPoints[0].MarkUsed(finalGrid, cols, checkPoints[0].posChar());
+        checkPoints.Last().MarkUsed(finalGrid, cols, 'X');
+        if (finalGrid.Count(ch => ch == '#') < 40)
+            goto startOver;
+
+        state = checkPoints[0];
+        grid = new string(finalGrid);
+        solution = shortestPath;
+        threadReady = true;
+    }
+
+    static int ManhattanDistance(GameState state1, GameState state2)
+    {
+        return Math.Abs(state1.curPosX - state2.curPosX) + Math.Abs(state1.curPosY - state2.curPosY);
+    }
+
     IEnumerator ResetGame()
     {
         resetActive = true;
         while (moves.Count > 0)
         {
-            switch (moves.Last())
-            {
-                case 0:
-                    Arrows[1].OnInteract();
-                    yield return new WaitUntil(() => !moveActive);
-                    break;
-                case 1:
-                    Arrows[0].OnInteract();
-                    yield return new WaitUntil(() => !moveActive);
-                    break;
-                case 2:
-                    Arrows[3].OnInteract();
-                    yield return new WaitUntil(() => !moveActive);
-                    break;
-                case 3:
-                    Arrows[2].OnInteract();
-                    yield return new WaitUntil(() => !moveActive);
-                    break;
-            }
-            moves.RemoveAt(moves.Count() - 1);
+            var dir = oppositeButtons[moves.Last()];
+            var prevState = state.Move(dir);
+            yield return movePlayer(dir, state, prevState);
+            state = prevState;
+            moves.RemoveAt(moves.Count - 1);
         }
         resetActive = false;
     }
@@ -188,7 +202,7 @@ public class BloxxScript : MonoBehaviour
     {
         return delegate
         {
-            if (moduleSolved || moveActive || resetActive || strikeActive)
+            if (!threadReady || moduleSolved || moveActive || resetActive || strikeActive)
                 return false;
 
             moves.Add(btn);
@@ -392,9 +406,9 @@ public class BloxxScript : MonoBehaviour
         {
             // Ran into a wall — strike
             Module.HandleStrike();
+            moves.RemoveAt(moves.Count - 1);
             strikeActive = true;
-            var oppositeButton = new[] { 1, 0, 3, 2 }[btn];
-            yield return movePlayer(oppositeButton, newState, oldState);
+            yield return movePlayer(oppositeButtons[btn], newState, oldState);
             state = oldState;
             strikeActive = false;
         }
@@ -406,7 +420,7 @@ public class BloxxScript : MonoBehaviour
             duration = 1f;
             elapsed = 0f;
             var oldPos = player.transform.localPosition;
-            var newPos = new Vector3(player.transform.localPosition.x, -0.011f, player.transform.localPosition.z);
+            var newPos = new Vector3(player.transform.localPosition.x, -0.02f, player.transform.localPosition.z);
             while (elapsed < duration)
             {
                 yield return null;
@@ -415,5 +429,66 @@ public class BloxxScript : MonoBehaviour
             }
         }
         yield break;
+    }
+
+#pragma warning disable 414
+    private readonly string TwitchHelpMessage = @"!{0} ULLURDD [move in the specified directions] | !{0} reset";
+#pragma warning restore 414
+
+    public IEnumerator ProcessTwitchCommand(string command)
+    {
+        Match m;
+        if ((m = Regex.Match(command, @"^\s*([udlr ,;]+)\s*$", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant)).Success)
+        {
+            yield return null;
+            foreach (var ch in m.Groups[1].Value)
+            {
+                switch (ch)
+                {
+                    case 'u': case 'U': Arrows[0].OnInteract(); break;
+                    case 'd': case 'D': Arrows[1].OnInteract(); break;
+                    case 'l': case 'L': Arrows[2].OnInteract(); break;
+                    case 'r': case 'R': Arrows[3].OnInteract(); break;
+                }
+                while (moveActive)
+                    yield return null;
+            }
+        }
+        else if (Regex.IsMatch(command, @"^\s*reset\s*$", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant))
+        {
+            yield return null;
+            yield return new[] { Reset };
+        }
+    }
+
+    public IEnumerator TwitchHandleForcedSolve()
+    {
+        while (!threadReady || moveActive || resetActive || strikeActive)
+            yield return true;
+
+        if (moduleSolved)
+            yield break;
+
+        yield return null;  // It is possible for this coroutine to continue before waitForThread() gets a chance to create the gameObjects
+
+        int solutionIx = -1;
+        while (moves.Count > 0 && (solutionIx = solution.IndexOf(pe => pe.State.Equals(state))) == -1)
+        {
+            // Undo a move
+            Arrows[oppositeButtons[moves.Last()]].OnInteract();
+            while (moveActive)
+                yield return true;
+            moves.RemoveRange(moves.Count - 2, 2);
+        }
+
+        for (var i = solutionIx + 1; i < solution.Length; i++)
+        {
+            Arrows[solution[i].Direction].OnInteract();
+            while (moveActive)
+                yield return true;
+        }
+
+        while (!moduleSolved)
+            yield return true;
     }
 }
