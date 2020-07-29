@@ -400,6 +400,7 @@ public partial class BloxxScript : MonoBehaviour
                     break;
             }
         }
+        Audio.PlaySoundAtTransform("Bloxx", transform);
         moveActive = false;
 
         if (newState.DeservesStrike(grid, cols))
